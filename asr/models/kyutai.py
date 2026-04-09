@@ -9,9 +9,7 @@ import librosa
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List
-
-# 🔥 NEW IMPORT (replace Parakeet)
-from nemo.collections.speechlm2.models import SALM
+from transformers import KyutaiSpeechToTextProcessor, KyutaiSpeechToTextForConditionalGeneration
 
 # ================= PATH SETUP ================= #
 
@@ -29,16 +27,18 @@ OUTPUT_ROOT = PROJECT_ROOT / "generated_transcripts"
 
 # ================= CONFIG ================= #
 
-MODELS = [
-    "nvidia/canary-qwen-2.5b",
-]
+MODEL_NAME = "kyutai/stt-2.6b-en-trfs"
+MODEL_TAG = "kyutai-stt-2.6b-en"
 
-TARGET_SR = 16000
-TMP_FILE = str(BASE_DIR / "tmp_segment.wav")
+TARGET_SR = 16000       # input audio SR
+MODEL_SR  = 24000       # Kyutai expects 24kHz
+TMP_FILE  = str(BASE_DIR / "tmp_segment.wav")
 
 # ================= DEVICE ================= #
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
+if device == "cuda":
+    torch.set_float32_matmul_precision("high")
 print(f"Using device: {device}")
 
 # ================= DATA STRUCT ================= #
@@ -61,7 +61,7 @@ def extract_conv_id(name: str):
 def parse_segments(file_path: Path) -> List[SpeechSegment]:
     segments = []
 
-    with open(file_path, "r", encoding="utf-8") as f:
+    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
         lines = f.readlines()
 
     for line in lines[1:]:
@@ -122,7 +122,7 @@ def pick_segment_file(segment_files: List[Path]) -> Path:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run Canary ASR on clean and/or noisy audio")
+    parser = argparse.ArgumentParser(description="Run Kyutai ASR on clean and/or noisy audio")
     parser.add_argument(
         "--split",
         choices=["both", "clean", "noisy"],
@@ -134,74 +134,113 @@ def parse_args():
 # ================= AUDIO ================= #
 
 def extract_segment(audio, sr, start, end):
+    """Extract segment and write as 24kHz wav (required by Kyutai)."""
     s = int(start * sr)
     e = min(int(end * sr), len(audio))
 
-    if s >= len(audio):
+    if s >= len(audio) or e <= s:
         return None
 
     segment = audio[s:e]
 
+    if segment is None or segment.size == 0:
+        return None
+
     if len(segment) < 0.1 * sr:
         return None
 
-    sf.write(TMP_FILE, segment.astype(np.float32), sr)
+    segment = np.nan_to_num(segment, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Resample to 24kHz for Kyutai
+    if sr != MODEL_SR:
+        segment = librosa.resample(segment, orig_sr=sr, target_sr=MODEL_SR)
+
+    if segment is None or segment.size == 0:
+        return None
+
+    sf.write(TMP_FILE, segment.astype(np.float32), MODEL_SR)
     return TMP_FILE
+
+# ================= MODEL LOAD ================= #
+
+def load_model():
+    print(f"\nLoading model: {MODEL_NAME}")
+
+    processor = KyutaiSpeechToTextProcessor.from_pretrained(MODEL_NAME)
+
+    model = KyutaiSpeechToTextForConditionalGeneration.from_pretrained(
+        MODEL_NAME,
+        device_map=device,
+        dtype="auto",
+    )
+    model.eval()
+
+    print(f"Model loaded with dtype: {model.dtype}")
+    return model, processor
 
 # ================= ASR ================= #
 
-def load_model(name):
-    print(f"\nLoading model: {name}")
-
-    model = SALM.from_pretrained(name)
-
-    model = model.to(device)
-
-    # 🔥 IMPORTANT for RTX 4060 (8GB)
-    model = model.half()
-
-    model.eval()
-    return model
-
-
 @torch.inference_mode()
-def transcribe(model, audio_file):
+def transcribe(model, processor, audio_file):
     try:
-        outputs = model.generate(
-            prompts=[
-                [{
-                    "role": "user",
-                    "content": f"Transcribe: {model.audio_locator_tag}",
-                    "audio": [audio_file]
-                }]
-            ],
-            max_new_tokens=128,
+        # Load 24kHz audio as numpy array
+        audio_array, sr = sf.read(audio_file, dtype="float32", always_2d=False)
+        assert sr == MODEL_SR, f"Expected {MODEL_SR}Hz, got {sr}Hz"
+
+        if audio_array is None or getattr(audio_array, "size", 0) == 0:
+            raise ValueError("Empty audio array")
+
+        if getattr(audio_array, "ndim", 1) > 1:
+            audio_array = audio_array.mean(axis=1)
+
+        audio_array = np.nan_to_num(audio_array, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+        if audio_array.size < int(0.05 * MODEL_SR):
+            return ""
+
+        inputs = processor(
+            audio=audio_array,
+            sampling_rate=MODEL_SR,
+            return_tensors="pt",
+        )
+        inputs = inputs.to(model.device)
+
+        output_tokens = model.generate(
+            **inputs,
+            cache_implementation="static",
         )
 
-        out = outputs[0]
+        if output_tokens is None:
+            raise RuntimeError("Model returned no tokens")
 
-        if isinstance(out, torch.Tensor):
-            text = model.tokenizer.ids_to_text(out.cpu())
-        else:
-            text = str(out)
+        decoded = processor.batch_decode(output_tokens, skip_special_tokens=True)
+        if not decoded:
+            return ""
 
+        text = decoded[0]
         return text.strip()
 
     except Exception as e:
-        print(f"[TRANSCRIBE ERROR] {e}")
+        print(f"[TRANSCRIBE ERROR] {audio_file}: {e}")
         return ""
 
 # ================= CORE ================= #
 
-def process_file(model, audio_path, segments):
+def process_file(model, processor, audio_path, segments):
     results = []
 
-    # 🔥 LOAD AUDIO ONCE (BIG SPEEDUP)
-    data, sr = sf.read(audio_path)
+    # Load full audio once at original SR
+    data, sr = sf.read(audio_path, dtype="float32", always_2d=False)
 
-    if len(data.shape) > 1:
+    if data is None or getattr(data, "size", 0) == 0:
+        raise ValueError(f"Empty or unreadable audio file: {audio_path}")
+
+    if data.ndim > 1:
         data = data.mean(axis=1)
 
+    data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Resample to TARGET_SR first for segment boundary accuracy
     if sr != TARGET_SR:
         data = librosa.resample(data, orig_sr=sr, target_sr=TARGET_SR)
         sr = TARGET_SR
@@ -211,12 +250,13 @@ def process_file(model, audio_path, segments):
         if not tmp:
             continue
 
-        text = transcribe(model, tmp)
+        text = transcribe(model, processor, tmp)
+        torch.cuda.empty_cache()
 
         results.append({
             "speaker": seg.speaker,
             "start": seg.start,
-            "text": text
+            "text": text,
         })
 
     results.sort(key=lambda x: x["start"])
@@ -224,101 +264,6 @@ def process_file(model, audio_path, segments):
     return "\n".join([f"{r['speaker']}: {r['text']}" for r in results])
 
 # ================= DRIVER ================= #
-
-# def run():
-#     index = build_index()
-
-#     all_wavs = []
-#     source_roots = [
-#         ("noisy", NOISY_ROOT),
-#         ("clean", CLEAN_ROOT),
-#     ]
-
-#     for source_name, source_root in source_roots:
-#         if not source_root.exists():
-#             print(f"[WARN] Missing audio folder: {source_root}")
-#             continue
-
-#         for root, _, files in os.walk(source_root):
-#             for f in files:
-#                 if f.lower().endswith(".wav"):
-#                     all_wavs.append((source_name, source_root, Path(root), f))
-
-#     print(f"\nFound {len(all_wavs)} audio files")
-
-#     for model_name in MODELS:
-#         model = load_model(model_name)
-#         model_tag = model_name.split("/")[-1]
-
-#         processed = 0
-#         skipped = 0
-#         errors = 0
-
-#         for source_name, source_root, root, wav in all_wavs:
-#             conv_id = extract_conv_id(wav)
-
-#             if processed < 3:
-#                 print("\n[DEBUG]")
-#                 print("source:", source_name)
-#                 print("wav:", wav)
-#                 print("conv_id:", conv_id)
-
-#             if not conv_id or conv_id not in index:
-#                 print(f"[NO MATCH] {wav}")
-#                 skipped += 1
-#                 continue
-
-#             seg_file = index[conv_id][0]
-#             segments = parse_segments(seg_file)
-
-#             if not segments:
-#                 print(f"[EMPTY SEGMENTS] {seg_file}")
-#                 skipped += 1
-#                 continue
-
-#             rel_path = root.relative_to(source_root)
-#             output_dir = OUTPUT_ROOT / model_tag / source_name / rel_path
-#             output_dir.mkdir(parents=True, exist_ok=True)
-
-#             output_file = output_dir / f"{conv_id}.txt"
-
-#             if output_file.exists():
-#                 skipped += 1
-#                 continue
-
-#             audio_path = root / wav
-
-#             try:
-#                 print(f"Processing: {audio_path}")
-
-#                 convo = process_file(model, audio_path, segments)
-
-#                 with open(output_file, "w", encoding="utf-8") as f:
-#                     f.write(convo)
-
-#                 processed += 1
-
-#             except Exception as e:
-#                 errors += 1
-#                 print(f"[ERROR] {wav}: {e}")
-
-#         print(f"\n=== Model {model_tag} DONE ===")
-#         print(f"Processed: {processed}")
-#         print(f"Skipped: {skipped}")
-#         print(f"Errors: {errors}")
-
-#         del model
-#         torch.cuda.empty_cache()
-
-#     if os.path.exists(TMP_FILE):
-#         os.remove(TMP_FILE)
-
-#     print("\nALL DONE")
-
-# # ================= RUN ================= #
-
-# if __name__ == "__main__":
-#     run()
 
 def run(split_mode: str = "both"):
     source_specs = []
@@ -345,25 +290,31 @@ def run(split_mode: str = "both"):
                 if f.lower().endswith(".wav"):
                     all_wavs.append((source_name, source_root, Path(root), f))
 
+    max_wavs = int(os.environ.get("MAX_WAVS", "0"))
+    if max_wavs > 0:
+        all_wavs = all_wavs[:max_wavs]
+        print(f"\nDebug limit enabled: MAX_WAVS={max_wavs}")
+
     print(f"\nFound {len(all_wavs)} audio files")
 
-    for model_name in MODELS:
-        model = load_model(model_name)
-        model_tag = model_name.split("/")[-1]
+    model, processor = load_model()
 
-        processed = 0
-        skipped = 0
-        errors = 0
+    processed = 0
+    skipped = 0
+    errors = 0
+    debug_seen = 0
 
-        for source_name, source_root, root, wav in all_wavs:
+    for source_name, source_root, root, wav in all_wavs:
+        try:
             conv_id = extract_conv_id(wav)
             split_index = indexes.get(source_name, {})
 
-            if processed < 3:
+            if debug_seen < 3:
                 print("\n[DEBUG]")
                 print("source:", source_name)
                 print("wav:", wav)
                 print("conv_id:", conv_id)
+                debug_seen += 1
 
             if not conv_id or conv_id not in split_index:
                 print(f"[NO MATCH] {wav}")
@@ -379,7 +330,7 @@ def run(split_mode: str = "both"):
                 continue
 
             rel_path = root.relative_to(source_root)
-            output_dir = OUTPUT_ROOT / model_tag / source_name / rel_path
+            output_dir = OUTPUT_ROOT / MODEL_TAG / source_name / rel_path
             output_dir.mkdir(parents=True, exist_ok=True)
 
             output_file = output_dir / f"{conv_id}.txt"
@@ -388,29 +339,28 @@ def run(split_mode: str = "both"):
                 skipped += 1
                 continue
 
-            audio_path = root / wav
+            audio_path = str(root / wav)
 
-            try:
-                print(f"Processing: {audio_path}")
+            print(f"Processing: {audio_path}")
 
-                convo = process_file(model, audio_path, segments)
+            convo = process_file(model, processor, audio_path, segments)
 
-                with open(output_file, "w", encoding="utf-8") as f:
-                    f.write(convo)
+            with open(output_file, "w", encoding="utf-8") as f:
+                f.write(convo)
 
-                processed += 1
+            processed += 1
 
-            except Exception as e:
-                errors += 1
-                print(f"[ERROR] {wav}: {e}")
+        except Exception as e:
+            errors += 1
+            print(f"[ERROR] {wav}: {type(e).__name__}: {e}")
 
-        print(f"\n=== Model {model_tag} DONE ===")
-        print(f"Processed: {processed}")
-        print(f"Skipped: {skipped}")
-        print(f"Errors: {errors}")
+    print(f"\n=== {MODEL_TAG} DONE ===")
+    print(f"Processed: {processed}")
+    print(f"Skipped: {skipped}")
+    print(f"Errors: {errors}")
 
-        del model
-        torch.cuda.empty_cache()
+    del model
+    torch.cuda.empty_cache()
 
     if os.path.exists(TMP_FILE):
         os.remove(TMP_FILE)
