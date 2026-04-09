@@ -1,2 +1,5 @@
+__pycache__/
 generated_audios/
 audio_corruption/noise_library/
+generated_transcripts/
+*.wav
