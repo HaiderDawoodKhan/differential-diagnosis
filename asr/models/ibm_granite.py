@@ -2,7 +2,6 @@ import os
 import re
 import argparse
 import torch
-import torchaudio
 import soundfile as sf
 import numpy as np
 import librosa
@@ -42,8 +41,27 @@ TMP_FILE = str(BASE_DIR / "tmp_segment.wav")
 
 # ================= DEVICE ================= #
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Using device: {device}")
+
+def resolve_device(requested_device: str) -> str:
+    if requested_device != "auto":
+        if requested_device == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but is not available in this environment.")
+        if requested_device == "mps" and not torch.backends.mps.is_available():
+            raise RuntimeError("MPS was requested but is not available in this environment.")
+        return requested_device
+
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def model_dtype_for_device(selected_device: str) -> torch.dtype:
+    if selected_device == "cuda":
+        return torch.bfloat16
+    # float32 is the safest option on MPS/CPU for this model.
+    return torch.float32
 
 # ================= DATA STRUCT ================= #
 
@@ -133,6 +151,41 @@ def parse_args():
         default="both",
         help="Audio split to process. Defaults to both.",
     )
+    parser.add_argument(
+        "--device",
+        choices=["auto", "cuda", "mps", "cpu"],
+        default="auto",
+        help="Execution backend. Defaults to auto (cuda > mps > cpu).",
+    )
+    parser.add_argument(
+        "--limit-files",
+        type=int,
+        default=0,
+        help="Limit number of audio files processed (0 means all).",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Reprocess files even if transcripts already exist.",
+    )
+    parser.add_argument(
+        "--limit-segments",
+        type=int,
+        default=0,
+        help="Limit number of speaker segments processed per audio file (0 means all).",
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=200,
+        help="Maximum generated tokens per segment.",
+    )
+    parser.add_argument(
+        "--segment-offset",
+        type=int,
+        default=0,
+        help="Skip this many segments before applying --limit-segments.",
+    )
     return parser.parse_args()
 
 # ================= AUDIO ================= #
@@ -154,17 +207,34 @@ def extract_segment(audio, sr, start, end):
 
 # ================= MODEL LOAD ================= #
 
-def load_model():
+def load_model(selected_device: str):
     print(f"\nLoading model: {MODEL_NAME}")
+    dtype = model_dtype_for_device(selected_device)
+    print(f"Model backend: {selected_device} | torch dtype: {dtype}")
 
     processor = AutoProcessor.from_pretrained(MODEL_NAME)
     tokenizer = processor.tokenizer
 
-    model = AutoModelForSpeechSeq2Seq.from_pretrained(
-        MODEL_NAME,
-        device_map=device,
-        torch_dtype=torch.bfloat16,   # bfloat16 fits fine on RTX 4060 8GB
-    )
+    if selected_device == "cuda":
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            MODEL_NAME,
+            device_map="cuda",
+            torch_dtype=dtype,
+        )
+    elif selected_device == "mps":
+        # Let accelerate place modules safely across available memory on Apple Silicon.
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            MODEL_NAME,
+            device_map="auto",
+            torch_dtype=dtype,
+            max_memory={"mps": "6GiB", "cpu": "48GiB"},
+        )
+    else:
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            MODEL_NAME,
+            torch_dtype=dtype,
+        )
+        model.to(selected_device)
     model.eval()
 
     print("Model loaded.")
@@ -173,33 +243,35 @@ def load_model():
 # ================= ASR ================= #
 
 @torch.inference_mode()
-def transcribe(model, processor, tokenizer, audio_file):
+def transcribe(model, processor, tokenizer, audio_file, selected_device: str, max_new_tokens: int):
     try:
-        # Load audio — must be mono 16kHz
-        wav, sr = torchaudio.load(audio_file, normalize=True)
+        # Load audio with soundfile to avoid torchaudio/torchcodec runtime coupling.
+        wav, sr = sf.read(audio_file)
 
-        assert wav.shape[0] == 1, "Expected mono audio"
+        if wav.ndim > 1:
+            wav = wav.mean(axis=1)
+
         assert sr == TARGET_SR, f"Expected {TARGET_SR}Hz, got {sr}Hz"
+        wav = wav.astype(np.float32)
 
-        # Build chat prompt
+        # Follow Granite's official transformers usage: text prompt + audio tensor.
         chat = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": "Transcribe the following audio:",
-                "audio": wav,
-            },
+            {"role": "user", "content": "<|audio|>can you transcribe the speech into a written format?"},
         ]
+        prompt = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
 
         inputs = processor(
-            chat,
+            prompt,
+            wav,
             return_tensors="pt",
-            sampling_rate=TARGET_SR,
-        ).to(device)
+        ).to(selected_device)
 
         output_ids = model.generate(
             **inputs,
-            max_new_tokens=256,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            num_beams=1,
         )
 
         # Decode only newly generated tokens
@@ -215,7 +287,17 @@ def transcribe(model, processor, tokenizer, audio_file):
 
 # ================= CORE ================= #
 
-def process_file(model, processor, tokenizer, audio_path, segments):
+def process_file(
+    model,
+    processor,
+    tokenizer,
+    audio_path,
+    segments,
+    selected_device: str,
+    limit_segments: int,
+    max_new_tokens: int,
+    segment_offset: int,
+):
     results = []
 
     # Load full audio once
@@ -228,12 +310,23 @@ def process_file(model, processor, tokenizer, audio_path, segments):
         data = librosa.resample(data, orig_sr=sr, target_sr=TARGET_SR)
         sr = TARGET_SR
 
-    for seg in segments:
+    if segment_offset > 0:
+        segments = segments[segment_offset:]
+
+    if limit_segments > 0:
+        segments = segments[:limit_segments]
+
+    total_segments = len(segments)
+
+    for i, seg in enumerate(segments, start=1):
+        if total_segments <= 10 or i <= 3:
+            print(f"  Segment {i}/{total_segments} [{seg.start:.2f}s -> {seg.end:.2f}s]")
+
         tmp = extract_segment(data, sr, seg.start, seg.end)
         if not tmp:
             continue
 
-        text = transcribe(model, processor, tokenizer, tmp)
+        text = transcribe(model, processor, tokenizer, tmp, selected_device, max_new_tokens)
 
         results.append({
             "speaker": seg.speaker,
@@ -247,7 +340,18 @@ def process_file(model, processor, tokenizer, audio_path, segments):
 
 # ================= DRIVER ================= #
 
-def run(split_mode: str = "both"):
+def run(
+    split_mode: str = "both",
+    selected_device: str = "auto",
+    limit_files: int = 0,
+    overwrite: bool = False,
+    limit_segments: int = 0,
+    max_new_tokens: int = 200,
+    segment_offset: int = 0,
+):
+    selected_device = resolve_device(selected_device)
+    print(f"Using device: {selected_device}")
+
     source_specs = []
 
     if split_mode in ("both", "clean"):
@@ -274,7 +378,12 @@ def run(split_mode: str = "both"):
 
     print(f"\nFound {len(all_wavs)} audio files")
 
-    model, processor, tokenizer = load_model()
+    all_wavs.sort(key=lambda x: str(x[2] / x[3]))
+    if limit_files > 0:
+        all_wavs = all_wavs[:limit_files]
+        print(f"[TEST MODE] Limiting processing to {len(all_wavs)} file(s)")
+
+    model, processor, tokenizer = load_model(selected_device)
 
     processed = 0
     skipped = 0
@@ -309,7 +418,7 @@ def run(split_mode: str = "both"):
 
         output_file = output_dir / f"{conv_id}.txt"
 
-        if output_file.exists():
+        if output_file.exists() and not overwrite:
             skipped += 1
             continue
 
@@ -318,7 +427,17 @@ def run(split_mode: str = "both"):
         try:
             print(f"Processing: {audio_path}")
 
-            convo = process_file(model, processor, tokenizer, audio_path, segments)
+            convo = process_file(
+                model,
+                processor,
+                tokenizer,
+                audio_path,
+                segments,
+                selected_device,
+                limit_segments,
+                max_new_tokens,
+                segment_offset,
+            )
 
             with open(output_file, "w", encoding="utf-8") as f:
                 f.write(convo)
@@ -335,7 +454,8 @@ def run(split_mode: str = "both"):
     print(f"Errors: {errors}")
 
     del model
-    torch.cuda.empty_cache()
+    if selected_device == "cuda":
+        torch.cuda.empty_cache()
 
     if os.path.exists(TMP_FILE):
         os.remove(TMP_FILE)
@@ -346,4 +466,12 @@ def run(split_mode: str = "both"):
 
 if __name__ == "__main__":
     cli_args = parse_args()
-    run(split_mode=cli_args.split)
+    run(
+        split_mode=cli_args.split,
+        selected_device=cli_args.device,
+        limit_files=cli_args.limit_files,
+        overwrite=cli_args.overwrite,
+        limit_segments=cli_args.limit_segments,
+        max_new_tokens=cli_args.max_new_tokens,
+        segment_offset=cli_args.segment_offset,
+    )
