@@ -129,6 +129,11 @@ def parse_args():
         default="both",
         help="Audio split to process. Defaults to both.",
     )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Reprocess files even if transcripts already exist.",
+    )
     return parser.parse_args()
 
 # ================= AUDIO ================= #
@@ -320,7 +325,7 @@ def process_file(model, audio_path, segments):
 # if __name__ == "__main__":
 #     run()
 
-def run(split_mode: str = "both"):
+def run(split_mode: str = "both", overwrite: bool = False):
     source_specs = []
 
     if split_mode in ("both", "clean"):
@@ -384,7 +389,7 @@ def run(split_mode: str = "both"):
 
             output_file = output_dir / f"{conv_id}.txt"
 
-            if output_file.exists():
+            if output_file.exists() and not overwrite:
                 skipped += 1
                 continue
 
@@ -410,7 +415,8 @@ def run(split_mode: str = "both"):
         print(f"Errors: {errors}")
 
         del model
-        torch.cuda.empty_cache()
+        if device == "cuda":
+            torch.cuda.empty_cache()
 
     if os.path.exists(TMP_FILE):
         os.remove(TMP_FILE)
@@ -421,4 +427,4 @@ def run(split_mode: str = "both"):
 
 if __name__ == "__main__":
     cli_args = parse_args()
-    run(split_mode=cli_args.split)
+    run(split_mode=cli_args.split, overwrite=cli_args.overwrite)

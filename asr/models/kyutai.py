@@ -30,9 +30,7 @@ OUTPUT_ROOT = PROJECT_ROOT / "generated_transcripts"
 MODEL_NAME = "kyutai/stt-2.6b-en-trfs"
 MODEL_TAG = "kyutai-stt-2.6b-en"
 
-TARGET_SR = 16000       # input audio SR
 MODEL_SR  = 24000       # Kyutai expects 24kHz
-TMP_FILE  = str(BASE_DIR / "tmp_segment.wav")
 
 # ================= DEVICE ================= #
 
@@ -129,12 +127,23 @@ def parse_args():
         default="both",
         help="Audio split to process. Defaults to both.",
     )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Reprocess files even if transcripts already exist.",
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=128,
+        help="Maximum tokens to generate per segment.",
+    )
     return parser.parse_args()
 
 # ================= AUDIO ================= #
 
 def extract_segment(audio, sr, start, end):
-    """Extract segment and write as 24kHz wav (required by Kyutai)."""
+    """Extract a single segment array from already-resampled audio."""
     s = int(start * sr)
     e = min(int(end * sr), len(audio))
 
@@ -151,15 +160,7 @@ def extract_segment(audio, sr, start, end):
 
     segment = np.nan_to_num(segment, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # Resample to 24kHz for Kyutai
-    if sr != MODEL_SR:
-        segment = librosa.resample(segment, orig_sr=sr, target_sr=MODEL_SR)
-
-    if segment is None or segment.size == 0:
-        return None
-
-    sf.write(TMP_FILE, segment.astype(np.float32), MODEL_SR)
-    return TMP_FILE
+    return segment.astype(np.float32, copy=False)
 
 # ================= MODEL LOAD ================= #
 
@@ -167,11 +168,12 @@ def load_model():
     print(f"\nLoading model: {MODEL_NAME}")
 
     processor = KyutaiSpeechToTextProcessor.from_pretrained(MODEL_NAME)
+    torch_dtype = torch.float16 if device == "cuda" else torch.float32
 
     model = KyutaiSpeechToTextForConditionalGeneration.from_pretrained(
         MODEL_NAME,
         device_map=device,
-        dtype="auto",
+        torch_dtype=torch_dtype,
     )
     model.eval()
 
@@ -181,12 +183,8 @@ def load_model():
 # ================= ASR ================= #
 
 @torch.inference_mode()
-def transcribe(model, processor, audio_file):
+def transcribe(model, processor, audio_array, max_new_tokens: int):
     try:
-        # Load 24kHz audio as numpy array
-        audio_array, sr = sf.read(audio_file, dtype="float32", always_2d=False)
-        assert sr == MODEL_SR, f"Expected {MODEL_SR}Hz, got {sr}Hz"
-
         if audio_array is None or getattr(audio_array, "size", 0) == 0:
             raise ValueError("Empty audio array")
 
@@ -207,7 +205,8 @@ def transcribe(model, processor, audio_file):
 
         output_tokens = model.generate(
             **inputs,
-            cache_implementation="static",
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
         )
 
         if output_tokens is None:
@@ -221,12 +220,12 @@ def transcribe(model, processor, audio_file):
         return text.strip()
 
     except Exception as e:
-        print(f"[TRANSCRIBE ERROR] {audio_file}: {e}")
+        print(f"[TRANSCRIBE ERROR] {e}")
         return ""
 
 # ================= CORE ================= #
 
-def process_file(model, processor, audio_path, segments):
+def process_file(model, processor, audio_path, segments, max_new_tokens: int):
     results = []
 
     # Load full audio once at original SR
@@ -240,18 +239,17 @@ def process_file(model, processor, audio_path, segments):
 
     data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # Resample to TARGET_SR first for segment boundary accuracy
-    if sr != TARGET_SR:
-        data = librosa.resample(data, orig_sr=sr, target_sr=TARGET_SR)
-        sr = TARGET_SR
+    # Resample once to model-required sample rate.
+    if sr != MODEL_SR:
+        data = librosa.resample(data, orig_sr=sr, target_sr=MODEL_SR)
+        sr = MODEL_SR
 
     for seg in segments:
-        tmp = extract_segment(data, sr, seg.start, seg.end)
-        if not tmp:
+        segment = extract_segment(data, sr, seg.start, seg.end)
+        if segment is None:
             continue
 
-        text = transcribe(model, processor, tmp)
-        torch.cuda.empty_cache()
+        text = transcribe(model, processor, segment, max_new_tokens)
 
         results.append({
             "speaker": seg.speaker,
@@ -265,7 +263,7 @@ def process_file(model, processor, audio_path, segments):
 
 # ================= DRIVER ================= #
 
-def run(split_mode: str = "both"):
+def run(split_mode: str = "both", overwrite: bool = False, max_new_tokens: int = 128):
     source_specs = []
 
     if split_mode in ("both", "clean"):
@@ -335,7 +333,7 @@ def run(split_mode: str = "both"):
 
             output_file = output_dir / f"{conv_id}.txt"
 
-            if output_file.exists():
+            if output_file.exists() and not overwrite:
                 skipped += 1
                 continue
 
@@ -343,7 +341,7 @@ def run(split_mode: str = "both"):
 
             print(f"Processing: {audio_path}")
 
-            convo = process_file(model, processor, audio_path, segments)
+            convo = process_file(model, processor, audio_path, segments, max_new_tokens)
 
             with open(output_file, "w", encoding="utf-8") as f:
                 f.write(convo)
@@ -360,10 +358,8 @@ def run(split_mode: str = "both"):
     print(f"Errors: {errors}")
 
     del model
-    torch.cuda.empty_cache()
-
-    if os.path.exists(TMP_FILE):
-        os.remove(TMP_FILE)
+    if device == "cuda":
+        torch.cuda.empty_cache()
 
     print("\nALL DONE")
 
@@ -371,4 +367,8 @@ def run(split_mode: str = "both"):
 
 if __name__ == "__main__":
     cli_args = parse_args()
-    run(split_mode=cli_args.split)
+    run(
+        split_mode=cli_args.split,
+        overwrite=cli_args.overwrite,
+        max_new_tokens=cli_args.max_new_tokens,
+    )
