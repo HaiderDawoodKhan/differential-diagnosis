@@ -205,7 +205,7 @@ def transcribe(model, processor, audio_array, max_new_tokens: int):
 
         output_tokens = model.generate(
             **inputs,
-            max_new_tokens=max_new_tokens,
+            # max_new_tokens=max_new_tokens,
             do_sample=False,
         )
 

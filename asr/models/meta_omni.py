@@ -8,8 +8,15 @@ import librosa
 
 from pathlib import Path
 from dataclasses import dataclass
-from typing import List
-from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
+from typing import List, Optional
+
+try:
+    from omnilingual_asr.models.inference.pipeline import ASRInferencePipeline
+except ImportError as exc:
+    raise SystemExit(
+        "Missing dependency 'omnilingual-asr'. Install with: pip install omnilingual-asr"
+    ) from exc
+
 
 # ================= PATH SETUP ================= #
 
@@ -25,43 +32,29 @@ TEXTGRID_CLEAN_ROOT = TEXTGRID_ROOT / "clean"
 TEXTGRID_NOISY_ROOT = TEXTGRID_ROOT / "noisy"
 OUTPUT_ROOT = PROJECT_ROOT / "generated_transcripts"
 
+
 # ================= CONFIG ================= #
 
-MODEL_NAME = "ibm-granite/granite-speech-3.3-2b"
-MODEL_TAG = "granite-speech-3.3-2b"
-
-SYSTEM_PROMPT = (
-    "Knowledge Cutoff Date: April 2024.\n"
-    "Today's Date: April 9, 2025.\n"
-    "You are Granite, developed by IBM. You are a helpful AI assistant."
-)
-
+DEFAULT_MODEL_CARD = "omniASR_LLM_7B_v2"
 TARGET_SR = 16000
-TMP_FILE = str(BASE_DIR / "tmp_segment.wav")
+MIN_SEGMENT_SEC = 0.1
+MAX_SEGMENT_SEC = 39.5
+
 
 # ================= DEVICE ================= #
-
 
 def resolve_device(requested_device: str) -> str:
     if requested_device != "auto":
         if requested_device == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA was requested but is not available in this environment.")
-        if requested_device == "mps" and not torch.backends.mps.is_available():
-            raise RuntimeError("MPS was requested but is not available in this environment.")
         return requested_device
 
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
+    return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def model_dtype_for_device(selected_device: str) -> torch.dtype:
-    if selected_device == "cuda":
-        return torch.bfloat16
-    # float32 is the safest option on MPS/CPU for this model.
-    return torch.float32
+def dtype_for_device(selected_device: str) -> torch.dtype:
+    return torch.bfloat16 if selected_device == "cuda" else torch.float32
+
 
 # ================= DATA STRUCT ================= #
 
@@ -71,6 +64,7 @@ class SpeechSegment:
     end: float
     speaker: str
 
+
 # ================= ID EXTRACTION ================= #
 
 def extract_conv_id(name: str):
@@ -78,12 +72,13 @@ def extract_conv_id(name: str):
     match = re.search(r"(day\d+_consultation\d+)", name)
     return match.group(1) if match else None
 
+
 # ================= PARSER ================= #
 
 def parse_segments(file_path: Path) -> List[SpeechSegment]:
     segments = []
 
-    with open(file_path, "r", encoding="utf-8") as f:
+    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
         lines = f.readlines()
 
     for line in lines[1:]:
@@ -105,6 +100,7 @@ def parse_segments(file_path: Path) -> List[SpeechSegment]:
             continue
 
     return segments
+
 
 # ================= INDEX ================= #
 
@@ -143,8 +139,16 @@ def pick_segment_file(segment_files: List[Path]) -> Path:
     return next((p for p in segment_files if p.suffix.lower() == ".csv"), segment_files[0])
 
 
+def model_tag_from_card(model_card: str) -> str:
+    return model_card.lower().replace("_", "-")
+
+
+def model_supports_lang(model_card: str) -> bool:
+    return "_LLM_" in model_card
+
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run Granite ASR on clean and/or noisy audio")
+    parser = argparse.ArgumentParser(description="Run Meta Omnilingual ASR on clean and/or noisy audio")
     parser.add_argument(
         "--split",
         choices=["both", "clean", "noisy"],
@@ -152,10 +156,31 @@ def parse_args():
         help="Audio split to process. Defaults to both.",
     )
     parser.add_argument(
+        "--model-card",
+        type=str,
+        default=DEFAULT_MODEL_CARD,
+        help=(
+            "Omnilingual model card to load. "
+            "Examples: omniASR_LLM_7B_v2 or omniASR_CTC_7B_v2."
+        ),
+    )
+    parser.add_argument(
+        "--lang",
+        type=str,
+        default="eng_Latn",
+        help="Language code for LLM models (set to 'none' to disable).",
+    )
+    parser.add_argument(
         "--device",
-        choices=["auto", "cuda", "mps", "cpu"],
+        choices=["auto", "cuda", "cpu"],
         default="auto",
-        help="Execution backend. Defaults to auto (cuda > mps > cpu).",
+        help="Execution backend. Defaults to auto (cuda > cpu).",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Batch size for Omnilingual inference calls.",
     )
     parser.add_argument(
         "--limit-files",
@@ -175,12 +200,6 @@ def parse_args():
         help="Limit number of speaker segments processed per audio file (0 means all).",
     )
     parser.add_argument(
-        "--max-new-tokens",
-        type=int,
-        default=200,
-        help="Maximum generated tokens per segment.",
-    )
-    parser.add_argument(
         "--segment-offset",
         type=int,
         default=0,
@@ -188,122 +207,107 @@ def parse_args():
     )
     return parser.parse_args()
 
+
 # ================= AUDIO ================= #
 
-def extract_segment(audio, sr, start, end):
+def extract_segment(audio: np.ndarray, sr: int, start: float, end: float) -> Optional[np.ndarray]:
     s = int(start * sr)
     e = min(int(end * sr), len(audio))
 
-    if s >= len(audio):
+    if s >= len(audio) or e <= s:
         return None
 
     segment = audio[s:e]
 
-    if len(segment) < 0.1 * sr:
+    if segment is None or segment.size == 0:
         return None
 
-    sf.write(TMP_FILE, segment.astype(np.float32), sr)
-    return TMP_FILE
+    if len(segment) < int(MIN_SEGMENT_SEC * sr):
+        return None
+
+    return np.nan_to_num(segment, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+
+
+def split_segment_for_model(segment: np.ndarray, sr: int, max_segment_sec: float = MAX_SEGMENT_SEC) -> List[np.ndarray]:
+    max_samples = int(max_segment_sec * sr)
+    if segment.size <= max_samples:
+        return [segment]
+
+    chunks = []
+    for start in range(0, segment.size, max_samples):
+        chunk = segment[start:start + max_samples]
+        if chunk.size >= int(MIN_SEGMENT_SEC * sr):
+            chunks.append(chunk)
+    return chunks
+
 
 # ================= MODEL LOAD ================= #
 
-def load_model(selected_device: str):
-    print(f"\nLoading model: {MODEL_NAME}")
-    dtype = model_dtype_for_device(selected_device)
+def load_model(model_card: str, selected_device: str):
+    print(f"\nLoading model: {model_card}")
+    dtype = dtype_for_device(selected_device)
     print(f"Model backend: {selected_device} | torch dtype: {dtype}")
 
-    processor = AutoProcessor.from_pretrained(MODEL_NAME)
-    tokenizer = processor.tokenizer
-
-    if selected_device == "cuda":
-        model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            MODEL_NAME,
-            device_map="cuda",
-            torch_dtype=dtype,
-        )
-    elif selected_device == "mps":
-        # Let accelerate place modules safely across available memory on Apple Silicon.
-        model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            MODEL_NAME,
-            device_map="auto",
-            torch_dtype=dtype,
-            max_memory={"mps": "6GiB", "cpu": "48GiB"},
-        )
-    else:
-        model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            MODEL_NAME,
-            torch_dtype=dtype,
-        )
-        model.to(selected_device)
-    model.eval()
+    pipeline = ASRInferencePipeline(
+        model_card=model_card,
+        device=selected_device,
+        dtype=dtype,
+    )
 
     print("Model loaded.")
-    return model, processor, tokenizer
+    return pipeline
+
 
 # ================= ASR ================= #
 
 @torch.inference_mode()
-def transcribe(model, processor, tokenizer, audio_file, selected_device: str, max_new_tokens: int):
+def transcribe(
+    pipeline: ASRInferencePipeline,
+    audio_array: np.ndarray,
+    sr: int,
+    batch_size: int,
+    lang: Optional[str],
+):
     try:
-        # Load audio with soundfile to avoid torchaudio/torchcodec runtime coupling.
-        wav, sr = sf.read(audio_file)
+        inp = [{"waveform": audio_array, "sample_rate": sr}]
 
-        if wav.ndim > 1:
-            wav = wav.mean(axis=1)
+        kwargs = {"batch_size": batch_size}
+        if lang:
+            kwargs["lang"] = [lang]
 
-        assert sr == TARGET_SR, f"Expected {TARGET_SR}Hz, got {sr}Hz"
-        wav = wav.astype(np.float32)
+        output = pipeline.transcribe(inp, **kwargs)
+        if not output:
+            return ""
 
-        # Follow Granite's official transformers usage: text prompt + audio tensor.
-        chat = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": "<|audio|>can you transcribe the speech into a written format?"},
-        ]
-        prompt = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
-
-        inputs = processor(
-            prompt,
-            wav,
-            return_tensors="pt",
-        ).to(selected_device)
-
-        output_ids = model.generate(
-            **inputs,
-            do_sample=False,
-            num_beams=1,
-        )
-
-        # Decode only newly generated tokens
-        input_len = inputs["input_ids"].shape[1]
-        new_tokens = output_ids[0, input_len:]
-        text = tokenizer.decode(new_tokens, skip_special_tokens=True)
-
-        return text.strip()
+        return output[0].strip()
 
     except Exception as e:
         print(f"[TRANSCRIBE ERROR] {e}")
         return ""
 
+
 # ================= CORE ================= #
 
 def process_file(
-    model,
-    processor,
-    tokenizer,
-    audio_path,
-    segments,
-    selected_device: str,
+    pipeline: ASRInferencePipeline,
+    audio_path: str,
+    segments: List[SpeechSegment],
+    batch_size: int,
+    lang: Optional[str],
     limit_segments: int,
-    max_new_tokens: int,
     segment_offset: int,
 ):
     results = []
 
-    # Load full audio once
-    data, sr = sf.read(audio_path)
+    data, sr = sf.read(audio_path, dtype="float32", always_2d=False)
 
-    if len(data.shape) > 1:
+    if data is None or getattr(data, "size", 0) == 0:
+        raise ValueError(f"Empty or unreadable audio file: {audio_path}")
+
+    if data.ndim > 1:
         data = data.mean(axis=1)
+
+    data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
 
     if sr != TARGET_SR:
         data = librosa.resample(data, orig_sr=sr, target_sr=TARGET_SR)
@@ -321,35 +325,54 @@ def process_file(
         if total_segments <= 10 or i <= 3:
             print(f"  Segment {i}/{total_segments} [{seg.start:.2f}s -> {seg.end:.2f}s]")
 
-        tmp = extract_segment(data, sr, seg.start, seg.end)
-        if not tmp:
+        segment = extract_segment(data, sr, seg.start, seg.end)
+        if segment is None:
             continue
 
-        text = transcribe(model, processor, tokenizer, tmp, selected_device, max_new_tokens)
+        chunks = split_segment_for_model(segment, sr)
+        chunk_texts = []
 
-        results.append({
-            "speaker": seg.speaker,
-            "start": seg.start,
-            "text": text,
-        })
+        # Non-unlimited models accept <=40s, so longer diarized spans are chunked.
+        for chunk in chunks:
+            chunk_text = transcribe(pipeline, chunk, sr, batch_size, lang)
+            if chunk_text:
+                chunk_texts.append(chunk_text)
+
+        text = " ".join(chunk_texts).strip()
+
+        results.append(
+            {
+                "speaker": seg.speaker,
+                "start": seg.start,
+                "text": text,
+            }
+        )
 
     results.sort(key=lambda x: x["start"])
 
     return "\n".join([f"{r['speaker']}: {r['text']}" for r in results])
 
+
 # ================= DRIVER ================= #
 
 def run(
     split_mode: str = "both",
+    model_card: str = DEFAULT_MODEL_CARD,
+    lang: str = "eng_Latn",
     selected_device: str = "auto",
+    batch_size: int = 1,
     limit_files: int = 0,
     overwrite: bool = False,
     limit_segments: int = 0,
-    max_new_tokens: int = 200,
     segment_offset: int = 0,
 ):
     selected_device = resolve_device(selected_device)
     print(f"Using device: {selected_device}")
+
+    use_lang = None if lang.strip().lower() == "none" else lang.strip()
+    if use_lang and not model_supports_lang(model_card):
+        print(f"[INFO] Ignoring --lang for CTC model card: {model_card}")
+        use_lang = None
 
     source_specs = []
 
@@ -382,7 +405,8 @@ def run(
         all_wavs = all_wavs[:limit_files]
         print(f"[TEST MODE] Limiting processing to {len(all_wavs)} file(s)")
 
-    model, processor, tokenizer = load_model(selected_device)
+    model_tag = model_tag_from_card(model_card)
+    pipeline = load_model(model_card, selected_device)
 
     processed = 0
     skipped = 0
@@ -412,7 +436,7 @@ def run(
             continue
 
         rel_path = root.relative_to(source_root)
-        output_dir = OUTPUT_ROOT / MODEL_TAG / source_name / rel_path
+        output_dir = OUTPUT_ROOT / model_tag / source_name / rel_path
         output_dir.mkdir(parents=True, exist_ok=True)
 
         output_file = output_dir / f"{conv_id}.txt"
@@ -427,14 +451,12 @@ def run(
             print(f"Processing: {audio_path}")
 
             convo = process_file(
-                model,
-                processor,
-                tokenizer,
+                pipeline,
                 audio_path,
                 segments,
-                selected_device,
+                batch_size,
+                use_lang,
                 limit_segments,
-                max_new_tokens,
                 segment_offset,
             )
 
@@ -447,19 +469,16 @@ def run(
             errors += 1
             print(f"[ERROR] {wav}: {e}")
 
-    print(f"\n=== {MODEL_TAG} DONE ===")
+    print(f"\n=== {model_tag} DONE ===")
     print(f"Processed: {processed}")
     print(f"Skipped: {skipped}")
     print(f"Errors: {errors}")
 
-    del model
     if selected_device == "cuda":
         torch.cuda.empty_cache()
 
-    if os.path.exists(TMP_FILE):
-        os.remove(TMP_FILE)
-
     print("\nALL DONE")
+
 
 # ================= RUN ================= #
 
@@ -467,10 +486,12 @@ if __name__ == "__main__":
     cli_args = parse_args()
     run(
         split_mode=cli_args.split,
+        model_card=cli_args.model_card,
+        lang=cli_args.lang,
         selected_device=cli_args.device,
+        batch_size=cli_args.batch_size,
         limit_files=cli_args.limit_files,
         overwrite=cli_args.overwrite,
         limit_segments=cli_args.limit_segments,
-        max_new_tokens=cli_args.max_new_tokens,
         segment_offset=cli_args.segment_offset,
     )
