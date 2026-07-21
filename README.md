@@ -11,9 +11,9 @@ This repository contains a two-stage workflow:
 - Noisy generated audio: `generated_audios/noisy`
 - Clean generated audio: `generated_audios/clean`
 - Audio corruption script: `audio_corruption/merge_corrupt.py`
-- ASR script: `asr/models/canary_2.py`
+- ASR model scripts: `models/`
 - Segment annotations: `asr/pyannote_textgrid`
-- Transcript output root: `asr/generated_transcripts`
+- Transcript output root: `generated_transcripts`
 
 ## Noise Library Setup 
 
@@ -88,13 +88,15 @@ Skipped consultations are not merged, not corrupted, and do not appear in output
 	README.txt
 ```
 
-## 2) Generate ASR Transcripts (Canary)
+## 2) Generate ASR Transcripts
 
-Run:
+Run the model script you need from the top-level `models/` folder. For example:
 
 ```bash
-python asr/models/canary_2.py
+python models/canary_qwen_2_5b.py --split both
 ```
+
+A helper runner is also available at `models/run_asr_models.sh`.
 
 The script reads audio from:
 
@@ -107,16 +109,25 @@ It matches consultation IDs to segment files under:
 
 It writes transcripts to:
 
-- `asr/generated_transcripts/<model_name>/...`
+- `generated_transcripts/<model_name>/...`
 
-Current model list in script:
+Available model scripts:
 
-- `nvidia/canary-qwen-2.5b`
+- `models/whisper_large_v3_turbo.py`
+- `models/parakeet_tdt_0_6b_v3.py`
+- `models/canary_qwen_2_5b.py`
+- `models/granite_speech_3_3_2b.py`
+- `models/cohere_transcribe_03_2026.py`
+- `models/omniasr_llm_7b_v2.py`
+- `models/deepgram_nova_3.py`
+- `models/elevenlabs_scribe.py`
+- `models/assemblyai_universal_2.py`
+- `models/kyutai_stt_2_6b_en.py`
 
 ### Transcript output structure
 
 ```text
-asr/generated_transcripts/
+generated_transcripts/
 	canary-qwen-2.5b/
 		noisy/
 			<category>/snr_<value>/dayX_consultationYY.txt
@@ -126,7 +137,7 @@ asr/generated_transcripts/
 
 ## Environment Notes
 
-`asr/models/canary_2.py` requires Python packages including at least:
+The ASR scripts in `models/` require Python packages including at least:
 
 - torch
 - soundfile
